@@ -312,13 +312,52 @@ def wav_duration_seconds(path: str) -> float:
 # ---------------------------------------------------------------------------
 IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 
+# Gemini's native image models (Nano Banana / gemini-2.5-flash-image and
+# friends) have a hard "limit: 0" quota on the Free Tier -- this is a
+# billing requirement, not something retrying or key rotation can fix.
+# Waiting it out doesn't help either; it only works once billing is
+# enabled on the Google AI Studio / Cloud project behind the API key(s).
+# Until that's done (or as a backup if it ever fails for another reason),
+# fall back to a free, no-API-key image generator so the pipeline still
+# produces a finished video instead of dying on this one step.
+USE_FREE_IMAGE_FALLBACK = os.environ.get("GEMINI_IMAGE_FREE_FALLBACK", "1") != "0"
+
+
+def _free_fallback_image(prompt: str, out_path: str) -> str:
+    import urllib.parse
+    import urllib.request
+    url = (
+        "https://image.pollinations.ai/prompt/"
+        + urllib.parse.quote(prompt[:800])
+        + "?width=1024&height=576&nologo=true"
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = resp.read()
+    with open(out_path, "wb") as f:
+        f.write(data)
+    return out_path
+
 
 def generate_image(prompt: str, out_path: str, style_suffix: str = "", status_cb=None) -> str:
     full_prompt = prompt if not style_suffix else f"{prompt}, {style_suffix}"
-    resp = _generate_with_retry(IMAGE_MODEL, full_prompt, status_cb=status_cb)
-    for part in resp.candidates[0].content.parts:
-        if getattr(part, "inline_data", None) is not None:
-            with open(out_path, "wb") as f:
-                f.write(part.inline_data.data)
-            return out_path
-    raise RuntimeError("Image model returned no image data")
+    try:
+        # Only one quick attempt per key here (max_rounds=1): a Free Tier
+        # "limit: 0" quota error is permanent, not transient, so burning
+        # several retry rounds on it before falling back just wastes time.
+        resp = _generate_with_retry(IMAGE_MODEL, full_prompt, status_cb=status_cb, max_rounds=1)
+        for part in resp.candidates[0].content.parts:
+            if getattr(part, "inline_data", None) is not None:
+                with open(out_path, "wb") as f:
+                    f.write(part.inline_data.data)
+                return out_path
+        raise RuntimeError("Image model returned no image data")
+    except Exception as exc:
+        if not USE_FREE_IMAGE_FALLBACK:
+            raise
+        if status_cb:
+            status_cb(
+                "Gemini image model abhi billing ke bina available nahi — "
+                "free image service se banate hain..."
+            )
+        return _free_fallback_image(full_prompt, out_path)
