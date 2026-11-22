@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Story to Video — AI se Kahani ka Video Banao</title>
+<style>
+  :root{
+    --bg:#0f1117; --card:#171a23; --accent:#ff5a5f; --accent2:#5a7dff;
+    --text:#eef0f6; --muted:#9aa1b4; --border:#262a38;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; font-family:'Segoe UI',system-ui,sans-serif;
+    background:linear-gradient(160deg,#0f1117,#171a26);
+    color:var(--text); min-height:100vh; padding:24px;
+  }
+  .wrap{max-width:760px;margin:0 auto;}
+  h1{font-size:1.6rem; margin-bottom:4px;}
+  p.sub{color:var(--muted); margin-top:0; margin-bottom:24px;}
+  .card{
+    background:var(--card); border:1px solid var(--border); border-radius:14px;
+    padding:22px; margin-bottom:18px;
+  }
+  label{display:block; font-weight:600; margin-bottom:8px;}
+  textarea{
+    width:100%; min-height:220px; background:#0c0e14; color:var(--text);
+    border:1px solid var(--border); border-radius:10px; padding:14px;
+    font-size:1rem; resize:vertical; line-height:1.5;
+  }
+  select{
+    background:#0c0e14; color:var(--text); border:1px solid var(--border);
+    border-radius:8px; padding:8px 10px; margin-top:6px;
+  }
+  button{
+    background:linear-gradient(135deg,var(--accent),var(--accent2));
+    color:white; border:none; border-radius:10px; padding:13px 22px;
+    font-size:1rem; font-weight:700; cursor:pointer; margin-top:16px; width:100%;
+  }
+  button:disabled{opacity:.5; cursor:not-allowed;}
+  .progress-bar{
+    width:100%; height:10px; background:#0c0e14; border-radius:6px; overflow:hidden; margin:10px 0;
+  }
+  .progress-fill{
+    height:100%; background:linear-gradient(90deg,var(--accent),var(--accent2));
+    width:0%; transition:width .4s ease;
+  }
+  #statusMsg{color:var(--muted); font-size:.95rem;}
+  video{width:100%; border-radius:12px; margin-top:10px; display:none;}
+  #downloadLink{display:none; margin-top:10px; color:var(--accent2); font-weight:600;}
+  .hidden{display:none;}
+  .err{color:#ff8080;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📖 ➜ 🔊 ➜ 🖼️ ➜ 🎬 Story to Video</h1>
+  <p class="sub">Apni Hindi kahani/script paste karo — AI khud scenes banayega, voiceover generate karega, har scene ki image banayega aur sabko jodkar ek video de dega.</p>
+
+  <div class="card">
+    <form id="storyForm">
+      <label for="story">Kahani / Script</label>
+      <textarea id="story" name="story" placeholder="Yahan apni poori kahani Hindi mein likho ya paste karo..."></textarea>
+
+      <label for="voice" style="margin-top:14px;">Voice (optional)</label>
+      <select id="voice" name="voice">
+        <option value="">Default</option>
+        <option value="Algenib">Algenib (deep male)</option>
+        <option value="Puck">Puck (friendly)</option>
+        <option value="Kore">Kore (female)</option>
+      </select>
+
+      <button type="submit" id="submitBtn">Video Banao</button>
+    </form>
+  </div>
+
+  <div class="card hidden" id="progressCard">
+    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+    <div id="statusMsg">Shuru ho raha hai...</div>
+    <video id="resultVideo" controls></video>
+    <a id="downloadLink" href="#" download>⬇️ Video download karo</a>
+  </div>
+</div>
+
+<script>
+const form = document.getElementById('storyForm');
+const submitBtn = document.getElementById('submitBtn');
+const progressCard = document.getElementById('progressCard');
+const progressFill = document.getElementById('progressFill');
+const statusMsg = document.getElementById('statusMsg');
+const resultVideo = document.getElementById('resultVideo');
+const downloadLink = document.getElementById('downloadLink');
+
+let pollTimer = null;
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const story = document.getElementById('story').value.trim();
+  if (!story) return;
+
+  submitBtn.disabled = true;
+  progressCard.classList.remove('hidden');
+  resultVideo.style.display = 'none';
+  downloadLink.style.display = 'none';
+  statusMsg.textContent = 'Job bhej rahe hain...';
+  progressFill.style.width = '2%';
+
+  const fd = new FormData();
+  fd.append('story', story);
+  fd.append('voice', document.getElementById('voice').value);
+
+  const res = await fetch('/generate', { method: 'POST', body: fd });
+  const data = await res.json();
+  if (data.error) {
+    statusMsg.textContent = 'Error: ' + data.error;
+    statusMsg.classList.add('err');
+    submitBtn.disabled = false;
+    return;
+  }
+  pollStatus(data.job_id);
+});
+
+function pollStatus(jobId) {
+  pollTimer = setInterval(async () => {
+    const res = await fetch('/status/' + jobId);
+    const job = await res.json();
+
+    if (job.total) {
+      const pct = Math.min(100, Math.round((job.progress / job.total) * 95) + 2);
+      progressFill.style.width = pct + '%';
+    }
+    statusMsg.textContent = job.message || job.status;
+
+    if (job.status === 'done') {
+      clearInterval(pollTimer);
+      progressFill.style.width = '100%';
+      resultVideo.src = '/video/' + jobId;
+      resultVideo.style.display = 'block';
+      downloadLink.href = '/video/' + jobId;
+      downloadLink.style.display = 'inline-block';
+      submitBtn.disabled = false;
+    } else if (job.status === 'error') {
+      clearInterval(pollTimer);
+      statusMsg.classList.add('err');
+      submitBtn.disabled = false;
+    }
+  }, 2500);
+}
+</script>
+</body>
+</html>
