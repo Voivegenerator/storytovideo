@@ -126,10 +126,15 @@ def _generate_with_retry(models, contents, config=None, max_rounds=4,
 # 1. Scene splitting
 # ---------------------------------------------------------------------------
 TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-3.8-flash")
-# If the primary text model is overloaded (503), fall back to this one
-# instead of only waiting and retrying the same model.
+# If the primary text model is overloaded (503), fall back to these in
+# order instead of only waiting and retrying the same model. The last one
+# is deliberately a non-3.x model (Gemini 2.5 Pro) on its own, older,
+# separate quota/capacity pool -- the whole Gemini 3.x line (3.8/3.7/3.6
+# Flash) shares one newer pool that sees the heaviest demand spikes, so a
+# same-family fallback doesn't help when THAT pool itself is overloaded.
 TEXT_MODEL_FALLBACK = os.environ.get("GEMINI_TEXT_MODEL_FALLBACK", "gemini-3.7-flash")
-TEXT_MODELS = [m for m in (TEXT_MODEL, TEXT_MODEL_FALLBACK) if m]
+TEXT_MODEL_FALLBACK_2 = os.environ.get("GEMINI_TEXT_MODEL_FALLBACK_2", "gemini-2.5-pro")
+TEXT_MODELS = [m for m in (TEXT_MODEL, TEXT_MODEL_FALLBACK, TEXT_MODEL_FALLBACK_2) if m]
 
 SPLIT_PROMPT = """Tumhe ek Hindi kahani/script di jayegi. Ise chhote scenes mein todo.
 Har scene mein do cheezein honi chahiye:
