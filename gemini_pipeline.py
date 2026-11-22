@@ -58,7 +58,7 @@ def _keys_rotated():
 # ---------------------------------------------------------------------------
 # 1. Scene splitting
 # ---------------------------------------------------------------------------
-TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-2.5-flash")
+TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-3.8-flash")
 
 SPLIT_PROMPT = """Tumhe ek Hindi kahani/script di jayegi. Ise chhote scenes mein todo.
 Har scene mein do cheezein honi chahiye:
