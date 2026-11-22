@@ -64,25 +64,34 @@ def _is_retryable(exc) -> bool:
     ))
 
 
-def _generate_with_retry(model, contents, config=None, max_rounds=3, base_delay=4):
-    """Call generate_content, trying every configured key before giving up a
-    round, and backing off between rounds. Handles both per-key quota errors
-    and whole-model 503 'currently experiencing high demand' overload (which
-    isn't fixed by switching keys alone, but usually clears within seconds)."""
+def _generate_with_retry(models, contents, config=None, max_rounds=4, base_delay=6):
+    """Call generate_content, trying every configured key AND every model in
+    `models` (a model name, or a list to use as primary + fallbacks) before
+    giving up a round, backing off between rounds.
+
+    With only one API key configured (common for small projects), key
+    rotation alone doesn't help a whole-model 503 "currently experiencing
+    high demand" overload — that needs either a wait or a different model.
+    A brand-new model (like a model released very recently) sees the
+    heaviest demand spikes, so falling back to an older, less-loaded model
+    after a couple of 503s matters as much as the backoff does."""
+    if isinstance(models, str):
+        models = [models]
     last_exc = None
     for round_i in range(max_rounds):
-        for key in _keys_rotated():
-            try:
-                client = genai.Client(api_key=key)
-                kwargs = {"model": model, "contents": contents}
-                if config is not None:
-                    kwargs["config"] = config
-                return client.models.generate_content(**kwargs)
-            except Exception as exc:
-                last_exc = exc
-                if _is_retryable(exc):
-                    continue
-                raise
+        for model in models:
+            for key in _keys_rotated():
+                try:
+                    client = genai.Client(api_key=key)
+                    kwargs = {"model": model, "contents": contents}
+                    if config is not None:
+                        kwargs["config"] = config
+                    return client.models.generate_content(**kwargs)
+                except Exception as exc:
+                    last_exc = exc
+                    if _is_retryable(exc):
+                        continue
+                    raise
         if round_i < max_rounds - 1:
             time.sleep(base_delay * (round_i + 1))
     raise last_exc or RuntimeError("Gemini request failed after retries")
@@ -92,6 +101,10 @@ def _generate_with_retry(model, contents, config=None, max_rounds=3, base_delay=
 # 1. Scene splitting
 # ---------------------------------------------------------------------------
 TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-3.8-flash")
+# If the primary text model is overloaded (503), fall back to this one
+# instead of only waiting and retrying the same model.
+TEXT_MODEL_FALLBACK = os.environ.get("GEMINI_TEXT_MODEL_FALLBACK", "gemini-3.7-flash")
+TEXT_MODELS = [m for m in (TEXT_MODEL, TEXT_MODEL_FALLBACK) if m]
 
 SPLIT_PROMPT = """Tumhe ek Hindi kahani/script di jayegi. Ise chhote scenes mein todo.
 Har scene mein do cheezein honi chahiye:
@@ -117,7 +130,7 @@ Kahani:
 def split_story_to_scenes(story_text: str, max_scenes: int = 40) -> list[dict]:
     prompt = SPLIT_PROMPT.replace("{story}", story_text.strip())
     resp = _generate_with_retry(
-        TEXT_MODEL,
+        TEXT_MODELS,
         prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -165,7 +178,7 @@ def detect_narrator_gender(story_text: str) -> str:
     'female' if the model's answer is unclear."""
     prompt = GENDER_PROMPT.replace("{story}", story_text.strip()[:6000])
     resp = _generate_with_retry(
-        TEXT_MODEL,
+        TEXT_MODELS,
         prompt,
         config=types.GenerateContentConfig(temperature=0.0),
     )
