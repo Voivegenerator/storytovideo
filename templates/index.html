@@ -50,6 +50,16 @@
   #downloadLink{display:none; margin-top:10px; color:var(--accent2); font-weight:600;}
   .hidden{display:none;}
   .err{color:#ff8080;}
+  .checkbox-row{display:flex; align-items:flex-start; gap:10px; margin-top:16px;}
+  .checkbox-row input{margin-top:3px;}
+  .checkbox-row label{font-weight:600; margin-bottom:2px;}
+  .checkbox-row .hint{color:var(--muted); font-weight:400; font-size:.88rem; margin-top:2px;}
+  #sceneGallery{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:14px;}
+  @media (max-width:520px){ #sceneGallery{grid-template-columns:1fr;} }
+  .scene-card{background:#0c0e14; border:1px solid var(--border); border-radius:10px; overflow:hidden;}
+  .scene-card img{width:100%; display:block; aspect-ratio:16/9; object-fit:cover; background:#1a1d27;}
+  .scene-card .scene-text{padding:10px 12px; font-size:.85rem; color:var(--muted);}
+  .scene-card .scene-num{font-weight:700; color:var(--text);}
 </style>
 </head>
 <body>
@@ -71,6 +81,14 @@
         <option value="Puck">Puck (friendly)</option>
       </select>
 
+      <div class="checkbox-row">
+        <input type="checkbox" id="imagesOnly">
+        <div>
+          <label for="imagesOnly" style="margin-bottom:2px;">Sirf scenes + images (audio/video ke bina)</label>
+          <div class="hint">Jab voice/TTS quota khatam ho ya jaldi sirf scene images dekhne hon, tab ye chuno.</div>
+        </div>
+      </div>
+
       <button type="submit" id="submitBtn">Video Banao</button>
     </form>
   </div>
@@ -80,6 +98,7 @@
     <div id="statusMsg">Shuru ho raha hai...</div>
     <video id="resultVideo" controls></video>
     <a id="downloadLink" href="#" download>⬇️ Video download karo</a>
+    <div id="sceneGallery"></div>
   </div>
 </div>
 
@@ -91,6 +110,8 @@ const progressFill = document.getElementById('progressFill');
 const statusMsg = document.getElementById('statusMsg');
 const resultVideo = document.getElementById('resultVideo');
 const downloadLink = document.getElementById('downloadLink');
+const sceneGallery = document.getElementById('sceneGallery');
+const imagesOnly = document.getElementById('imagesOnly');
 
 let pollTimer = null;
 
@@ -103,12 +124,15 @@ form.addEventListener('submit', async (e) => {
   progressCard.classList.remove('hidden');
   resultVideo.style.display = 'none';
   downloadLink.style.display = 'none';
+  sceneGallery.innerHTML = '';
+  statusMsg.classList.remove('err');
   statusMsg.textContent = 'Job bhej rahe hain...';
   progressFill.style.width = '2%';
 
   const fd = new FormData();
   fd.append('story', story);
   fd.append('voice', document.getElementById('voice').value);
+  fd.append('mode', imagesOnly.checked ? 'images_only' : 'full');
 
   const res = await fetch('/generate', { method: 'POST', body: fd });
   const data = await res.json();
@@ -120,6 +144,17 @@ form.addEventListener('submit', async (e) => {
   }
   pollStatus(data.job_id);
 });
+
+function renderSceneGallery(scenes) {
+  sceneGallery.innerHTML = scenes.map(s => `
+    <div class="scene-card">
+      <img src="${s.image_url}" loading="lazy">
+      <div class="scene-text"><span class="scene-num">Scene ${s.index}:</span> ${
+        s.text.replace(/</g, '&lt;')
+      }</div>
+    </div>
+  `).join('');
+}
 
 function pollStatus(jobId) {
   pollTimer = setInterval(async () => {
@@ -135,11 +170,15 @@ function pollStatus(jobId) {
     if (job.status === 'done') {
       clearInterval(pollTimer);
       progressFill.style.width = '100%';
-      resultVideo.src = '/video/' + jobId;
-      resultVideo.style.display = 'block';
-      downloadLink.href = '/video/' + jobId;
-      downloadLink.style.display = 'inline-block';
       submitBtn.disabled = false;
+      if (job.scenes && job.scenes.length) {
+        renderSceneGallery(job.scenes);
+      } else {
+        resultVideo.src = '/video/' + jobId;
+        resultVideo.style.display = 'block';
+        downloadLink.href = '/video/' + jobId;
+        downloadLink.style.display = 'inline-block';
+      }
     } else if (job.status === 'error') {
       clearInterval(pollTimer);
       statusMsg.classList.add('err');
