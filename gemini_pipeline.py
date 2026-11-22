@@ -54,14 +54,19 @@ def _keys_rotated():
 
 def _is_retryable(exc) -> bool:
     """Quota limits (429/RESOURCE_EXHAUSTED), transient overload (503/
-    UNAVAILABLE/'high demand'), and a timed-out attempt are all worth
-    retrying on another key/model or after a short wait; anything else
-    (bad prompt, auth, etc.) should raise immediately."""
+    UNAVAILABLE/'high demand'), a timed-out attempt, and a model that
+    doesn't exist/isn't available to this account (404/NOT_FOUND/'no
+    longer available') are all worth moving past -- the 404 case matters
+    especially in a multi-model fallback list: one dead/retired model name
+    in the list must not abort the whole retry, it should just be skipped
+    in favor of the next model. Anything else (bad prompt, auth, etc.)
+    should raise immediately."""
     msg = str(exc)
     return any(s in msg for s in (
         "RESOURCE_EXHAUSTED", "429", "quota",
         "503", "UNAVAILABLE", "overloaded", "high demand",
         "timeout", "timed out", "Timeout",
+        "404", "NOT_FOUND", "no longer available",
     ))
 
 
@@ -127,14 +132,23 @@ def _generate_with_retry(models, contents, config=None, max_rounds=4,
 # ---------------------------------------------------------------------------
 TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-3.8-flash")
 # If the primary text model is overloaded (503), fall back to these in
-# order instead of only waiting and retrying the same model. The last one
-# is deliberately a non-3.x model (Gemini 2.5 Pro) on its own, older,
-# separate quota/capacity pool -- the whole Gemini 3.x line (3.8/3.7/3.6
-# Flash) shares one newer pool that sees the heaviest demand spikes, so a
-# same-family fallback doesn't help when THAT pool itself is overloaded.
+# order instead of only waiting and retrying the same model.
+#
+# IMPORTANT: this API key/project is a "new" Gemini account, and Google has
+# cut new accounts off from the entire pre-3.x model generation -- both
+# gemini-2.5-flash AND gemini-2.5-pro come back 404 "no longer available to
+# new users" here (confirmed from this app's own error logs), each time
+# pointing at a 3.x replacement. So every fallback below is deliberately a
+# Gemini 3.x model: first the other 3.x Flash versions (older ones see less
+# of the demand spike that hits the newest release), then, as a different
+# *class* of model on its own quota pool, the Pro line -- Google's own
+# suggested replacement for 2.5 Pro.
 TEXT_MODEL_FALLBACK = os.environ.get("GEMINI_TEXT_MODEL_FALLBACK", "gemini-3.7-flash")
-TEXT_MODEL_FALLBACK_2 = os.environ.get("GEMINI_TEXT_MODEL_FALLBACK_2", "gemini-2.5-pro")
-TEXT_MODELS = [m for m in (TEXT_MODEL, TEXT_MODEL_FALLBACK, TEXT_MODEL_FALLBACK_2) if m]
+TEXT_MODEL_FALLBACK_2 = os.environ.get("GEMINI_TEXT_MODEL_FALLBACK_2", "gemini-3.6-flash")
+TEXT_MODEL_FALLBACK_3 = os.environ.get("GEMINI_TEXT_MODEL_FALLBACK_3", "gemini-3.1-pro-preview")
+TEXT_MODELS = [m for m in (
+    TEXT_MODEL, TEXT_MODEL_FALLBACK, TEXT_MODEL_FALLBACK_2, TEXT_MODEL_FALLBACK_3,
+) if m]
 
 SPLIT_PROMPT = """Tumhe ek Hindi kahani/script di jayegi. Ise chhote scenes mein todo.
 Har scene mein do cheezein honi chahiye:
