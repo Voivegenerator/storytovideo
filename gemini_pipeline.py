@@ -18,8 +18,60 @@ import time
 import wave
 import itertools
 import threading
+import urllib.request
+import urllib.error
 from google import genai
 from google.genai import types
+
+# ---------------------------------------------------------------------------
+# Groq (free, OpenAI-compatible, Gemini-independent) text fallback.
+#
+# Gemini's Free Tier is unreliable for this project: Pro-class models have a
+# permanent zero quota, and after a day of testing even the Flash models get
+# rate-limited. Groq's free tier runs on completely separate infrastructure
+# and quota, so when GROQ_API_KEY is set, scene-splitting and gender-detect
+# try Groq FIRST and only fall back to Gemini if that fails too.
+# ---------------------------------------------------------------------------
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+# openai/gpt-oss-120b is Groq's current recommended model (their older free
+# Llama models, e.g. llama-3.3-70b-versatile, were deprecated/shut down in
+# 2026) -- gpt-oss-20b as a lighter second try.
+GROQ_TEXT_MODEL = os.environ.get("GROQ_TEXT_MODEL", "openai/gpt-oss-120b")
+GROQ_TEXT_MODEL_FALLBACK = os.environ.get("GROQ_TEXT_MODEL_FALLBACK", "openai/gpt-oss-20b")
+
+
+def _groq_chat(prompt: str, temperature: float = 0.4, status_cb=None) -> str:
+    """Call Groq's free chat-completions API. Raises if GROQ_API_KEY isn't
+    set or every configured Groq model fails."""
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY not configured")
+    models = [m for m in (GROQ_TEXT_MODEL, GROQ_TEXT_MODEL_FALLBACK) if m]
+    last_exc = None
+    for model in models:
+        body = json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.groq.com/openai/v1/chat/completions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+            return data["choices"][0]["message"]["content"]
+        except Exception as exc:
+            last_exc = exc
+            if status_cb:
+                status_cb(f"Groq ({model}) try fail hui, agla model try kar rahe hain...")
+            continue
+    raise last_exc or RuntimeError("Groq request failed")
 
 # ---------------------------------------------------------------------------
 # API key rotation (mirrors the multi-key setup already used on VoiceGenrator)
@@ -173,21 +225,36 @@ Kahani:
 
 def split_story_to_scenes(story_text: str, max_scenes: int = 40, status_cb=None) -> list[dict]:
     prompt = SPLIT_PROMPT.replace("{story}", story_text.strip())
-    resp = _generate_with_retry(
-        TEXT_MODELS,
-        prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.4,
-        ),
-        status_cb=status_cb,
-    )
-    raw = resp.text.strip()
-    # Defensive cleanup in case the model wraps JSON in ```json fences
+    raw = None
+    if GROQ_API_KEY:
+        try:
+            if status_cb:
+                status_cb("Groq se scenes bana rahe hain...")
+            raw = _groq_chat(prompt, temperature=0.4, status_cb=status_cb).strip()
+        except Exception:
+            raw = None  # fall through to Gemini below
+    if raw is None:
+        resp = _generate_with_retry(
+            TEXT_MODELS,
+            prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.4,
+            ),
+            status_cb=status_cb,
+        )
+        raw = resp.text.strip()
+    # Defensive cleanup in case the model wraps JSON in ```json fences, or
+    # (more common with Groq, which has no strict JSON mode here) adds a
+    # sentence of commentary before/after the array.
+    raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.strip("`")
         if raw.lower().startswith("json"):
             raw = raw[4:]
+    start, end = raw.find("["), raw.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        raw = raw[start:end + 1]
     scenes = json.loads(raw)
     if not isinstance(scenes, list) or not scenes:
         raise ValueError("Scene splitter returned no scenes")
@@ -222,13 +289,21 @@ def detect_narrator_gender(story_text: str, status_cb=None) -> str:
     as male or female, so the TTS voice can be auto-selected. Defaults to
     'female' if the model's answer is unclear."""
     prompt = GENDER_PROMPT.replace("{story}", story_text.strip()[:6000])
-    resp = _generate_with_retry(
-        TEXT_MODELS,
-        prompt,
-        config=types.GenerateContentConfig(temperature=0.0),
-        status_cb=status_cb,
-    )
-    raw = (resp.text or "").strip().lower()
+    raw = None
+    if GROQ_API_KEY:
+        try:
+            raw = _groq_chat(prompt, temperature=0.0, status_cb=status_cb)
+        except Exception:
+            raw = None  # fall through to Gemini below
+    if raw is None:
+        resp = _generate_with_retry(
+            TEXT_MODELS,
+            prompt,
+            config=types.GenerateContentConfig(temperature=0.0),
+            status_cb=status_cb,
+        )
+        raw = resp.text or ""
+    raw = raw.strip().lower()
     # check "female" first since "male" is a substring of "female"
     if "female" in raw:
         return "female"
