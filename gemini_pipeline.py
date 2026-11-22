@@ -16,6 +16,7 @@ import json
 import struct
 import wave
 import itertools
+import threading
 from google import genai
 from google.genai import types
 
@@ -37,10 +38,21 @@ if not _KEYS:
         "variable before starting the app."
     )
 _key_cycle = itertools.cycle(_KEYS)
+_key_lock = threading.Lock()
+_key_cursor = [0]
 
 
 def _client():
     return genai.Client(api_key=next(_key_cycle))
+
+
+def _keys_rotated():
+    """All configured keys, starting at a different one each call (round-robin),
+    same quota-spreading approach as VoiceGenrator's app.py."""
+    with _key_lock:
+        start = _key_cursor[0] % len(_KEYS)
+        _key_cursor[0] += 1
+    return _KEYS[start:] + _KEYS[:start]
 
 
 # ---------------------------------------------------------------------------
@@ -93,10 +105,20 @@ def split_story_to_scenes(story_text: str, max_scenes: int = 40) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 2. TTS (same approach as the VoiceGenrator Gemini voices)
+# 2. TTS (same emotional/expressive engine as VoiceGenrator's "hi_new_gemini"
+# voice: same model, same style-instruction prefix, same quota-aware
+# multi-key rotation/retry — just driving this app's own voice pipeline)
 # ---------------------------------------------------------------------------
 TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
-DEFAULT_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Algenib")
+DEFAULT_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Kore")
+
+# Natural-language style instruction Gemini TTS follows, placed before the
+# narration text — this is what makes the narration emotional/expressive
+# instead of flat. Identical wording to VoiceGenrator's GEMINI_STYLE.
+GEMINI_STYLE = os.environ.get(
+    "GEMINI_TTS_STYLE",
+    "भावनात्मक और कहानी सुनाने वाले अंदाज़ में, प्राकृतिक उतार-चढ़ाव के साथ बोलो",
+)
 
 
 def _pcm_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = 24000, channels: int = 1) -> bytes:
@@ -111,22 +133,44 @@ def _pcm_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = 24000, channels: int 
     return buf.getvalue()
 
 
-def generate_tts(text: str, out_path: str, voice: str = None) -> str:
-    client = _client()
-    resp = client.models.generate_content(
-        model=TTS_MODEL,
-        contents=text,
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=voice or DEFAULT_VOICE
-                    )
-                )
-            ),
-        ),
-    )
+def generate_tts(text: str, out_path: str, voice: str = None, style: str = None) -> str:
+    """Emotional/expressive Gemini TTS narration.
+
+    Tries each configured Gemini API key (round-robin start, same as
+    VoiceGenrator) until one works; a quota error (RESOURCE_EXHAUSTED/429)
+    moves on to the next key instead of failing the whole scene.
+    """
+    voice_name = voice or DEFAULT_VOICE
+    prompt = f"{style or GEMINI_STYLE}: {text}"
+    resp = None
+    last_exc = None
+    for key in _keys_rotated():
+        try:
+            client = genai.Client(api_key=key)
+            resp = client.models.generate_content(
+                model=TTS_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=voice_name
+                            )
+                        )
+                    ),
+                ),
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc)
+            if "RESOURCE_EXHAUSTED" in msg or "429" in msg or "quota" in msg.lower():
+                continue
+            raise
+    if resp is None:
+        raise last_exc or RuntimeError("All Gemini API keys exhausted")
+
     part = resp.candidates[0].content.parts[0]
     pcm = part.inline_data.data
     wav_bytes = _pcm_to_wav_bytes(pcm)
