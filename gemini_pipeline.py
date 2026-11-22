@@ -398,7 +398,11 @@ IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 USE_FREE_IMAGE_FALLBACK = os.environ.get("GEMINI_IMAGE_FREE_FALLBACK", "1") != "0"
 
 
-def _free_fallback_image(prompt: str, out_path: str) -> str:
+def _free_fallback_image(prompt: str, out_path: str, status_cb=None) -> str:
+    """Pollinations.ai is a free, shared, no-API-key service -- it has no
+    uptime guarantee and returns its own transient 503s/timeouts under load.
+    Retry a few times with backoff before giving up, so one busy moment on
+    their end doesn't kill the whole video job."""
     import urllib.parse
     import urllib.request
     url = (
@@ -407,10 +411,48 @@ def _free_fallback_image(prompt: str, out_path: str) -> str:
         + "?width=1024&height=576&nologo=true"
     )
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = resp.read()
-    with open(out_path, "wb") as f:
-        f.write(data)
+    attempts = 4
+    last_exc = None
+    for i in range(attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+            with open(out_path, "wb") as f:
+                f.write(data)
+            return out_path
+        except Exception as exc:
+            last_exc = exc
+            if i < attempts - 1:
+                if status_cb:
+                    status_cb(
+                        f"Free image service thodi busy hai, retry kar rahe hain "
+                        f"({i + 1}/{attempts})..."
+                    )
+                time.sleep(5 * (i + 1))
+    raise last_exc
+
+
+def _placeholder_image(prompt: str, out_path: str) -> str:
+    """Last-resort image when both Gemini and the free fallback are
+    unavailable: a plain dark card with the scene text, so the video still
+    has something to show instead of the whole job failing."""
+    from PIL import Image, ImageDraw, ImageFont
+    import textwrap
+
+    img = Image.new("RGB", (1024, 576), color=(24, 24, 32))
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
+    except Exception:
+        font = ImageFont.load_default()
+    text = textwrap.fill(prompt[:220], width=40)
+    bbox = draw.multiline_textbbox((0, 0), text, font=font, align="center")
+    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    draw.multiline_text(
+        ((1024 - w) / 2, (576 - h) / 2), text, font=font,
+        fill=(235, 235, 235), align="center",
+    )
+    img.save(out_path)
     return out_path
 
 
@@ -435,4 +477,16 @@ def generate_image(prompt: str, out_path: str, style_suffix: str = "", status_cb
                 "Gemini image model abhi billing ke bina available nahi — "
                 "free image service se banate hain..."
             )
-        return _free_fallback_image(full_prompt, out_path)
+        try:
+            return _free_fallback_image(full_prompt, out_path, status_cb=status_cb)
+        except Exception:
+            # Free fallback itself is down/overloaded (e.g. a 503 from
+            # pollinations.ai) even after retries. Don't let one scene's
+            # image kill the whole video -- draw a simple placeholder so
+            # the pipeline can still finish.
+            if status_cb:
+                status_cb(
+                    "Free image service abhi down hai — placeholder image "
+                    "ke saath aage badh rahe hain..."
+                )
+            return _placeholder_image(full_prompt, out_path)
