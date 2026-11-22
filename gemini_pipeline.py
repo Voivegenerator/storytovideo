@@ -53,21 +53,34 @@ def _keys_rotated():
 
 
 def _is_retryable(exc) -> bool:
-    """Quota limits (429/RESOURCE_EXHAUSTED) and transient overload (503/
-    UNAVAILABLE/'high demand') are both worth retrying on another key or
-    after a short wait; anything else (bad prompt, auth, etc.) should raise
-    immediately."""
+    """Quota limits (429/RESOURCE_EXHAUSTED), transient overload (503/
+    UNAVAILABLE/'high demand'), and a timed-out attempt are all worth
+    retrying on another key/model or after a short wait; anything else
+    (bad prompt, auth, etc.) should raise immediately."""
     msg = str(exc)
     return any(s in msg for s in (
         "RESOURCE_EXHAUSTED", "429", "quota",
         "503", "UNAVAILABLE", "overloaded", "high demand",
+        "timeout", "timed out", "Timeout",
     ))
 
 
-def _generate_with_retry(models, contents, config=None, max_rounds=4, base_delay=6):
+# How long a single attempt may hang before we give up on it and move to the
+# next key/model/round. Without this, the google-genai client has NO default
+# timeout — under a genuine "high demand" overload, a single call can hang
+# for minutes with no error at all, which just looks like the app is frozen.
+REQUEST_TIMEOUT_MS = int(os.environ.get("GEMINI_REQUEST_TIMEOUT_MS", "25000"))
+
+
+def _generate_with_retry(models, contents, config=None, max_rounds=4,
+                          base_delay=6, status_cb=None):
     """Call generate_content, trying every configured key AND every model in
     `models` (a model name, or a list to use as primary + fallbacks) before
-    giving up a round, backing off between rounds.
+    giving up a round, backing off between rounds. Each individual attempt
+    is capped at REQUEST_TIMEOUT_MS so a slow/overloaded attempt fails fast
+    instead of hanging. Optional status_cb(message) is called before each
+    retry so a caller (e.g. the Flask job status) can show live progress
+    instead of looking stuck.
 
     With only one API key configured (common for small projects), key
     rotation alone doesn't help a whole-model 503 "currently experiencing
@@ -77,19 +90,31 @@ def _generate_with_retry(models, contents, config=None, max_rounds=4, base_delay
     after a couple of 503s matters as much as the backoff does."""
     if isinstance(models, str):
         models = [models]
+    http_options = types.HttpOptions(timeout=REQUEST_TIMEOUT_MS)
     last_exc = None
+    attempt = 0
+    total_attempts = max_rounds * len(models) * len(_KEYS)
     for round_i in range(max_rounds):
         for model in models:
             for key in _keys_rotated():
+                attempt += 1
                 try:
                     client = genai.Client(api_key=key)
                     kwargs = {"model": model, "contents": contents}
                     if config is not None:
-                        kwargs["config"] = config
+                        merged = config.model_copy(update={"http_options": http_options})
+                        kwargs["config"] = merged
+                    else:
+                        kwargs["config"] = types.GenerateContentConfig(http_options=http_options)
                     return client.models.generate_content(**kwargs)
                 except Exception as exc:
                     last_exc = exc
                     if _is_retryable(exc):
+                        if status_cb:
+                            status_cb(
+                                f"Gemini thoda busy hai, dusra tareeka try kar rahe hain "
+                                f"({attempt}/{total_attempts})..."
+                            )
                         continue
                     raise
         if round_i < max_rounds - 1:
@@ -127,7 +152,7 @@ Kahani:
 """
 
 
-def split_story_to_scenes(story_text: str, max_scenes: int = 40) -> list[dict]:
+def split_story_to_scenes(story_text: str, max_scenes: int = 40, status_cb=None) -> list[dict]:
     prompt = SPLIT_PROMPT.replace("{story}", story_text.strip())
     resp = _generate_with_retry(
         TEXT_MODELS,
@@ -136,6 +161,7 @@ def split_story_to_scenes(story_text: str, max_scenes: int = 40) -> list[dict]:
             response_mime_type="application/json",
             temperature=0.4,
         ),
+        status_cb=status_cb,
     )
     raw = resp.text.strip()
     # Defensive cleanup in case the model wraps JSON in ```json fences
@@ -172,7 +198,7 @@ AUTO_VOICE_MAP = {
 }
 
 
-def detect_narrator_gender(story_text: str) -> str:
+def detect_narrator_gender(story_text: str, status_cb=None) -> str:
     """Ask the text model whether the story's narrator/main character reads
     as male or female, so the TTS voice can be auto-selected. Defaults to
     'female' if the model's answer is unclear."""
@@ -181,6 +207,7 @@ def detect_narrator_gender(story_text: str) -> str:
         TEXT_MODELS,
         prompt,
         config=types.GenerateContentConfig(temperature=0.0),
+        status_cb=status_cb,
     )
     raw = (resp.text or "").strip().lower()
     # check "female" first since "male" is a substring of "female"
@@ -220,7 +247,8 @@ def _pcm_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = 24000, channels: int 
     return buf.getvalue()
 
 
-def generate_tts(text: str, out_path: str, voice: str = None, style: str = None) -> str:
+def generate_tts(text: str, out_path: str, voice: str = None, style: str = None,
+                  status_cb=None) -> str:
     """Emotional/expressive Gemini TTS narration.
 
     Tries each configured Gemini API key (round-robin start, same as
@@ -242,6 +270,7 @@ def generate_tts(text: str, out_path: str, voice: str = None, style: str = None)
                 )
             ),
         ),
+        status_cb=status_cb,
     )
 
     part = resp.candidates[0].content.parts[0]
@@ -265,9 +294,9 @@ def wav_duration_seconds(path: str) -> float:
 IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 
 
-def generate_image(prompt: str, out_path: str, style_suffix: str = "") -> str:
+def generate_image(prompt: str, out_path: str, style_suffix: str = "", status_cb=None) -> str:
     full_prompt = prompt if not style_suffix else f"{prompt}, {style_suffix}"
-    resp = _generate_with_retry(IMAGE_MODEL, full_prompt)
+    resp = _generate_with_retry(IMAGE_MODEL, full_prompt, status_cb=status_cb)
     for part in resp.candidates[0].content.parts:
         if getattr(part, "inline_data", None) is not None:
             with open(out_path, "wb") as f:
