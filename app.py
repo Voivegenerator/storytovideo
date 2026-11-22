@@ -79,6 +79,15 @@ def video(job_id):
 
 def _run_pipeline(job_id, job_dir, story, voice):
     try:
+        resolved_voice = voice
+        if not voice or voice == "auto":
+            _set_status(job_id, status="splitting",
+                        message="Kahani padhkar awaaz (male/female) decide kar rahe hain...")
+            gender = gp.detect_narrator_gender(story)
+            resolved_voice = gp.AUTO_VOICE_MAP.get(gender, gp.DEFAULT_VOICE)
+            label = "पुरुष" if gender == "male" else "महिला"
+            _set_status(job_id, message=f"Awaaz auto-select hui: {label} ({resolved_voice})")
+
         _set_status(job_id, status="splitting", message="Story ko scenes mein tod rahe hain...")
         scenes = gp.split_story_to_scenes(story)
         n = len(scenes)
@@ -94,7 +103,7 @@ def _run_pipeline(job_id, job_dir, story, voice):
             clip_path = os.path.join(job_dir, f"clip_{i:03d}.mp4")
 
             _set_status(job_id, progress=i - 1, message=f"Scene {i}/{n}: voice bana rahe hain...")
-            gp.generate_tts(narration, audio_path, voice=voice)
+            gp.generate_tts(narration, audio_path, voice=resolved_voice)
 
             _set_status(job_id, message=f"Scene {i}/{n}: image bana rahe hain...")
             gp.generate_image(image_prompt, image_path,

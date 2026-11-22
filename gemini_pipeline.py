@@ -14,6 +14,7 @@ set GEMINI_API_KEY_2..5 too and call pick_api_key() before each request.
 import os
 import json
 import struct
+import time
 import wave
 import itertools
 import threading
@@ -42,10 +43,6 @@ _key_lock = threading.Lock()
 _key_cursor = [0]
 
 
-def _client():
-    return genai.Client(api_key=next(_key_cycle))
-
-
 def _keys_rotated():
     """All configured keys, starting at a different one each call (round-robin),
     same quota-spreading approach as VoiceGenrator's app.py."""
@@ -53,6 +50,42 @@ def _keys_rotated():
         start = _key_cursor[0] % len(_KEYS)
         _key_cursor[0] += 1
     return _KEYS[start:] + _KEYS[:start]
+
+
+def _is_retryable(exc) -> bool:
+    """Quota limits (429/RESOURCE_EXHAUSTED) and transient overload (503/
+    UNAVAILABLE/'high demand') are both worth retrying on another key or
+    after a short wait; anything else (bad prompt, auth, etc.) should raise
+    immediately."""
+    msg = str(exc)
+    return any(s in msg for s in (
+        "RESOURCE_EXHAUSTED", "429", "quota",
+        "503", "UNAVAILABLE", "overloaded", "high demand",
+    ))
+
+
+def _generate_with_retry(model, contents, config=None, max_rounds=3, base_delay=4):
+    """Call generate_content, trying every configured key before giving up a
+    round, and backing off between rounds. Handles both per-key quota errors
+    and whole-model 503 'currently experiencing high demand' overload (which
+    isn't fixed by switching keys alone, but usually clears within seconds)."""
+    last_exc = None
+    for round_i in range(max_rounds):
+        for key in _keys_rotated():
+            try:
+                client = genai.Client(api_key=key)
+                kwargs = {"model": model, "contents": contents}
+                if config is not None:
+                    kwargs["config"] = config
+                return client.models.generate_content(**kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if _is_retryable(exc):
+                    continue
+                raise
+        if round_i < max_rounds - 1:
+            time.sleep(base_delay * (round_i + 1))
+    raise last_exc or RuntimeError("Gemini request failed after retries")
 
 
 # ---------------------------------------------------------------------------
@@ -82,11 +115,10 @@ Kahani:
 
 
 def split_story_to_scenes(story_text: str, max_scenes: int = 40) -> list[dict]:
-    client = _client()
     prompt = SPLIT_PROMPT.replace("{story}", story_text.strip())
-    resp = client.models.generate_content(
-        model=TEXT_MODEL,
-        contents=prompt,
+    resp = _generate_with_retry(
+        TEXT_MODEL,
+        prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             temperature=0.4,
@@ -102,6 +134,48 @@ def split_story_to_scenes(story_text: str, max_scenes: int = 40) -> list[dict]:
     if not isinstance(scenes, list) or not scenes:
         raise ValueError("Scene splitter returned no scenes")
     return scenes[:max_scenes]
+
+
+# ---------------------------------------------------------------------------
+# 1b. Narrator/character gender auto-detect (for voice auto-select)
+# ---------------------------------------------------------------------------
+GENDER_PROMPT = """Neeche ek Hindi kahani/script hai. Batao ki is kahani ka MAIN
+narrator ya pradhan character — jiski awaaz mein voiceover bolna sabse natural
+lagega — MALE hai ya FEMALE.
+
+Sirf ek shabd English mein return karo, bilkul aur kuch nahi: "male" ya "female".
+
+Kahani:
+---
+{story}
+---
+"""
+
+# Which prebuilt Gemini voice each detected gender maps to. Override via env
+# if you want different defaults without touching code.
+AUTO_VOICE_MAP = {
+    "male": os.environ.get("GEMINI_TTS_VOICE_MALE", "Charon"),
+    "female": os.environ.get("GEMINI_TTS_VOICE_FEMALE", "Kore"),
+}
+
+
+def detect_narrator_gender(story_text: str) -> str:
+    """Ask the text model whether the story's narrator/main character reads
+    as male or female, so the TTS voice can be auto-selected. Defaults to
+    'female' if the model's answer is unclear."""
+    prompt = GENDER_PROMPT.replace("{story}", story_text.strip()[:6000])
+    resp = _generate_with_retry(
+        TEXT_MODEL,
+        prompt,
+        config=types.GenerateContentConfig(temperature=0.0),
+    )
+    raw = (resp.text or "").strip().lower()
+    # check "female" first since "male" is a substring of "female"
+    if "female" in raw:
+        return "female"
+    if "male" in raw:
+        return "male"
+    return "female"
 
 
 # ---------------------------------------------------------------------------
@@ -142,34 +216,20 @@ def generate_tts(text: str, out_path: str, voice: str = None, style: str = None)
     """
     voice_name = voice or DEFAULT_VOICE
     prompt = f"{style or GEMINI_STYLE}: {text}"
-    resp = None
-    last_exc = None
-    for key in _keys_rotated():
-        try:
-            client = genai.Client(api_key=key)
-            resp = client.models.generate_content(
-                model=TTS_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=voice_name
-                            )
-                        )
-                    ),
-                ),
-            )
-            break
-        except Exception as exc:
-            last_exc = exc
-            msg = str(exc)
-            if "RESOURCE_EXHAUSTED" in msg or "429" in msg or "quota" in msg.lower():
-                continue
-            raise
-    if resp is None:
-        raise last_exc or RuntimeError("All Gemini API keys exhausted")
+    resp = _generate_with_retry(
+        TTS_MODEL,
+        prompt,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=voice_name
+                    )
+                )
+            ),
+        ),
+    )
 
     part = resp.candidates[0].content.parts[0]
     pcm = part.inline_data.data
@@ -193,12 +253,8 @@ IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 
 
 def generate_image(prompt: str, out_path: str, style_suffix: str = "") -> str:
-    client = _client()
     full_prompt = prompt if not style_suffix else f"{prompt}, {style_suffix}"
-    resp = client.models.generate_content(
-        model=IMAGE_MODEL,
-        contents=full_prompt,
-    )
+    resp = _generate_with_retry(IMAGE_MODEL, full_prompt)
     for part in resp.candidates[0].content.parts:
         if getattr(part, "inline_data", None) is not None:
             with open(out_path, "wb") as f:
